@@ -12,4 +12,4 @@ if not api_key:
 os.environ['GOOGLE_API_KEY'] = api_key
 
 client = genai.Client(api_key=api_key)
-MODEL_ID = "gemini-2.5-flash"
+MODEL_ID = "gemini-2.0-flash"

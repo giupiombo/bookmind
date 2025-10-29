@@ -4,9 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from google.genai import types
 from config import client, MODEL_ID
-from typing import Literal, List, Optional
+from typing import Optional
 import requests
-
+import json
+import asyncio
 
 app = FastAPI()
 
@@ -20,66 +21,84 @@ app.add_middleware(
 
 # --- Request Models ---
 
-## -- Book Recommendation --
 class BookRecommendation(BaseModel):
-    """A recommended book with a cover image URL."""
     title: str = Field(description="The title of the recommended book.")
     author: str = Field(description="The author of the recommended book.")
     cover_url: str = Field(description="A publicly accessible URL for the book's cover image.")
     reasoning: str = Field(description="A brief explanation of why this book was recommended.")
 
 class RecommendationList(BaseModel):
-    """A list of book recommendations."""
     recommendations: list[BookRecommendation] = Field(description="A list of 3 book recommendations.")
 
 class BookRequest(BaseModel):
     prompt: str = Field(description="A user prompt describing their book preferences.", example="A sci-fi book with a strong female lead.")
 
-## -- Search Author(s) / Book(s) --
+class AgentBookRecommendation(BaseModel):
+    title: str = Field(description="The title of the recommended book.")
+    author: str = Field(description="The author of the recommended book.")
+    reasoning: str = Field(description="A brief explanation of why this book was recommended.")
 
-class SearchRequest(BaseModel):
-    """A request to search for a specific type of entity (Author or Book)."""
-    type: Literal["author", "book"] = Field(description="The type of entity to search for: 'author' or 'book'.")
-    text: str = Field(description="The query string (e.g., a book title, or an author's name).", example="Colleen Hoover")
+class AgentRecommendationList(BaseModel):
+    recommendations: list[AgentBookRecommendation] = Field(description="A list of 3 book recommendations.")
 
-class SearchResultList(BaseModel):
-    """A list containing either book or author results, but not both."""
-    books: List[str] = Field(default_factory=list, description="A list of up to 20 matching books. This is populated only if the request type was 'book'.")
-    authors: List[str] = Field(default_factory=list, description="A list of up to 20 matching authors. This is populated only if the request type was 'author'.")
+# --- Helper Functions ---
+
+def lookup_cover(title: str, author: str) -> str:
+    """
+    Synchronously queries Open Library to find the most stable cover URL.
+    This function MUST be called via run_in_threadpool in async endpoints.
+    """
+    try:
+        url = "https://openlibrary.org/search.json"
+        params = {"title": title, "author": author}
+
+        res = requests.get(url, params=params, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+
+        if not data.get("docs"):
+            return "https://placehold.co/200x300/e0e0e0/000000?text=Cover+Not+Found"
+
+        doc = data["docs"][0]
+        isbn = doc.get("isbn", [None])
+        cover_id = doc.get("cover_i")
+
+        if isbn and isinstance(isbn, list) and isbn[0]:
+            clean_isbn = isbn[0].replace('-', '').replace(' ', '')
+            return f"https://covers.openlibrary.org/b/isbn/{clean_isbn}-L.jpg"
+        elif cover_id:
+            return f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
+        else:
+            return "https://placehold.co/200x300/e0e0e0/000000?text=Cover+Not+Found"
+
+    except requests.exceptions.RequestException as e:
+        print(f"HTTP Error looking up cover for {title} by {author}: {e}")
+        return "https://placehold.co/200x300/e0e0e0/000000?text=Error+Loading"
+    except Exception as e:
+        print(f"General Error looking up cover for {title} by {author}: {e}")
+        return "https://placehold.co/200x300/e0e0e0/000000?text=Error+Loading"
+
 
 # --- API Endpoints ---
 
-## -- Book Recommendation --
 @app.post("/recommendations", response_model=RecommendationList)
 async def get_recommendations(request: BookRequest):
     """
-    Generates structured book recommendations based on a user's prompt using the Gemini model.
+    Generates structured book recommendations from the AI, then programmatically
+    fetches reliable cover URLs using Open Library.
     """
     system_instruction = (
       "You are a helpful and creative book recommendation agent. "
-      "Your task is to provide exactly 3 book recommendations based on the user's prompt. "
-      "Crucially, you must find a publicly accessible, stable, and reliable cover image URL for each book. "
-
-      "**STABILITY PROTOCOL:** "
-      "To ensure the link works, you must find a URL that is a **direct link to the image file** (it must end in .jpg, .png, etc.) and is hosted on a public, non-commercial, or institutional domain."
-
-      "**PRIORITY 1: OPEN LIBRARY COVERS API (ISBN) - WITH RELIABILITY CHECK** "
-      "First, find the **ISBN-13** for the book. Prioritize the ISBN-13 corresponding to the **original or most widely circulated paperback edition**, as these are the most likely to have a cover available in the Open Library Covers API."
-      "Then, generate the cover URL using the stable Open Library Covers API format: **https://covers.openlibrary.org/b/isbn/{ISBN-13}-L.jpg**. "
-      "If this link is likely to return a blank/placeholder image (e.g., if the book is obscure or very new), proceed to Priority 2."
-
-      "**PRIORITY 2: DIRECT PUBLIC DOMAIN/INSTITUTIONAL IMAGE** "
-      "If the Open Library link is unreliable, search for the book cover image and specifically prioritize finding a **simple, direct link** (ending in .jpg, .png) from a major public institution (e.g., a university library, Library of Congress) or a reliable, simple content delivery network. "
-
-      "**AVOID ALL:** Do not use links that contain complex API parameters (like 'zoom', 'source=gbs\_api', or 'SYxxx') or are hosted on primary retail domains (Amazon, Goodreads, B&N). These links always break or result in 'Image Not Available'."
-
-      "The response must be in the specified JSON format."
+      "Your task is to provide exactly 3 distinct book recommendations based on the user's prompt. "
+      "Crucially, you must provide the **exact title and author** for each book so that a cover image can be located by the external system. "
+      "**DO NOT PROVIDE A COVER URL.** The URL will be fetched by a separate function using the title and author you provide."
+      "The response must strictly adhere to the provided JSON schema."
     )
 
-    schema_dict = RecommendationList.model_json_schema()
+    agent_schema_dict = AgentRecommendationList.model_json_schema()
 
     try:
-        # Call the Gemini API with structured output configuration
+        # 1. Get Recommendations (Title, Author, Reasoning) from the AI
         response = await run_in_threadpool(
             client.models.generate_content,
             model=MODEL_ID,
@@ -87,82 +106,72 @@ async def get_recommendations(request: BookRequest):
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 response_mime_type="application/json",
-                response_schema=schema_dict,
+                response_schema=agent_schema_dict,
             )
         )
 
-        # The response.text will be a JSON string conforming to RecommendationList
-        return RecommendationList.model_validate_json(response.text)
+        agent_result = AgentRecommendationList.model_validate(json.loads(response.text))
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        raise HTTPException(status_code=500, detail="Error generating content from AI agent.")
+        cover_tasks = []
+        for item in agent_result.recommendations:
+            task = run_in_threadpool(lookup_cover, title=item.title, author=item.author)
+            cover_tasks.append(task)
 
-## -- Book Search --
-@app.post("/search", response_model=SearchResultList)
-async def search(request: SearchRequest):
-    """
-    Searches for either books or authors based on a focused query and returns a list
-    of up to 20 possible matches in the 'books' or 'authors' field, leaving the other empty.
-    """
-    search_type = request.type
-    search_text = request.text
+        # 2. Concurrently fetch all cover URLs
+        cover_urls = await asyncio.gather(*cover_tasks)
 
-    # Customize the instruction based on the requested type
-    if search_type == "book":
-        instruction_focus = (
-            "The user wants a list of **AUTHORS**. Search for authors that closely match the book title provided."
-            "Populate the **'authors'** array with the top 20 results, ensuring you provide only the author's name. "
-            "The 'books' array MUST be an empty list."
-        )
-    else: # type == "author"
-        instruction_focus = (
-            "The user wants a list of **BOOKS**. Search for books who were written by the given author. "
-            "Populate the **'books'** array with the top 20 results, ensuring you provide only titles that were written by that author. "
-            "The 'authors' array MUST be an empty list."
-        )
+        final_recommendations = []
 
-    system_instruction = (
-        "You are a focused book metadata search agent. "
-        "Your task is to search the web for entities based on the user's specified search type and query. "
-        "Return a list of up to 20 high-confidence results. "
-        f"{instruction_focus}"
-
-        "**CRITICAL:** Do not include any ISBN or cover URL in this result. "
-        "The response must strictly adhere to the provided JSON schema, having one array populated and the other empty."
-    )
-
-    schema_dict = SearchResultList.model_json_schema()
-
-    try:
-        response = await run_in_threadpool(
-            client.models.generate_content,
-            model=MODEL_ID,
-            contents=f"Search Type: {search_type}, Search Text: {search_text}",
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                response_schema=schema_dict,
+        # 3. Combine AI data with deterministic cover URL
+        for item, cover_url in zip(agent_result.recommendations, cover_urls):
+            final_recommendations.append(
+                BookRecommendation(
+                    title=item.title,
+                    author=item.author,
+                    reasoning=item.reasoning,
+                    cover_url=cover_url
+                )
             )
-        )
-        return SearchResultList.model_validate_json(response.text)
+
+        # 4. Return the final structured result
+        return RecommendationList(recommendations=final_recommendations)
 
     except Exception as e:
-        print(f"An error occurred: {e}")
-        raise HTTPException(status_code=500, detail="Error performing book search.")
+        print(f"An error occurred in /recommendations: {e}")
+        if 'response' in locals() and hasattr(response, 'text'):
+            print(f"AI Raw Response: {response.text}")
+        raise HTTPException(status_code=500, detail="Error generating book recommendations.")
 
 @app.get("/search-books")
 def search_books(
-    title: Optional[str] = Query(None),
-    author: Optional[str] = Query(None)
+    title: Optional[str] = Query(
+        None,
+        example="Verity",
+        description="Title of the book to search for."
+    ),
+    author: Optional[str] = Query(
+        None,
+        example="Coleen Hoover",
+        description="Author of the book to search for."
+    )
 ):
+    """
+    Performs a direct search against Open Library for books and returns a list
+    with associated cover URLs based on ISBN or cover ID.
+    """
     if not title and not author:
         return {"error": "Please provide at least a title or author"}
 
     url = "https://openlibrary.org/search.json"
     params = {"title": title, "author": author}
-    res = requests.get(url, params=params)
-    data = res.json()
+
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Open Library API error: {e}")
+
 
     books = []
     for doc in data.get("docs", [])[:20]:
@@ -173,7 +182,8 @@ def search_books(
         cover_url = None
 
         if isbn:
-            cover_url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg"
+            clean_isbn = isbn.replace('-', '').replace(' ', '')
+            cover_url = f"https://covers.openlibrary.org/b/isbn/{clean_isbn}-L.jpg"
         elif cover_id:
             cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
 
@@ -185,33 +195,28 @@ def search_books(
             "publish_year": doc.get("first_publish_year")
         })
 
-    books = [b for b in books if b["isbn"] or b["cover_url"]]
+    books = [b for b in books if b.get("isbn") or b.get("cover_url")]
 
     return {"count": len(books), "results": books[:10]}
 
 @app.get("/get_cover")
-def get_cover(title: str, author: str = ""):
-    # Query Open Library
-    url = f"https://openlibrary.org/search.json?title={title}&author={author}"
-    res = requests.get(url)
-    data = res.json()
-
-    if not data["docs"]:
-        return {"error": "Book not found"}
-
-    doc = data["docs"][0]
-    isbn = doc.get("isbn", [None])[0]
-    cover_id = doc.get("cover_i")
-
-    cover_url = None
-    if isbn:
-        cover_url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg"
-    elif cover_id:
-        cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
+def get_cover(
+    title: str = Query(
+        ...,
+        example="The Housemaid"
+    ),
+    author: str = Query(
+        "",
+        example="Freida McFadden"
+    )
+):
+    """
+    Get single book cover.
+    """
+    cover_url = lookup_cover(title, author)
 
     return {
-        "title": doc.get("title"),
-        "author": doc.get("author_name", ["Unknown"])[0],
-        "isbn": isbn,
+        "title": title,
+        "author": author,
         "cover_url": cover_url
     }
